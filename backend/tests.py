@@ -24,6 +24,7 @@ The engine's game logic and money math are VERIFIED CORRECT and are NOT modified
 by QA. If a test here fails, it means a real regression — see QA_FINDINGS.md.
 """
 
+import json
 import os
 import sys
 import unittest
@@ -61,9 +62,13 @@ def _stack(table, seq):
     """Replace the table's shoe with an exact, ordered deck (front dealt first).
 
     cut_card_position is pushed far negative so the engine never auto-reshuffles
-    mid-scenario (which would rebuild a random shoe and ruin determinism).
+    mid-scenario (which would rebuild a random shoe and ruin determinism). A
+    random filler shoe follows the stacked cards so the pre-deal "enough cards
+    left?" check never forces a reshuffle; draws past `seq` are random, as
+    before.
     """
-    table.shoe.cards = [Card(r, s) for (r, s) in seq]
+    filler = Shoe(6).cards
+    table.shoe.cards = [Card(r, s) for (r, s) in seq] + filler
     table.shoe.cut_card_position = -10 ** 9
     table.shoe.reshuffle_needed = False
 
@@ -561,11 +566,42 @@ class TestShoe(unittest.TestCase):
         self.assertIs(dealt, front)
         self.assertEqual(len(shoe.cards), 311)
 
-    def test_cut_card_position_in_range(self):
-        shoe = Shoe(6)
-        # cut card sits 104..156 cards from the end of the shoe
-        from_end = len(shoe.cards) - shoe.cut_card_position
-        self.assertTrue(104 <= from_end <= 156)
+    def test_penetration_is_about_75_percent_for_every_deck_count(self):
+        # REVIEW E5/E6, QA B1: the cut is a FRACTION of the shoe (72-78% dealt),
+        # not a fixed 104-156 cards, so it works for 1-2 decks and deepens
+        # with more decks instead of shrinking.
+        for decks in (1, 2, 4, 6, 8):
+            for _ in range(50):
+                shoe = Shoe(decks)
+                n = len(shoe.cards)
+                self.assertGreater(shoe.cut_card_position, 0, decks)
+                dealt = (n - shoe.cut_card_position) / n
+                self.assertTrue(0.70 <= dealt <= 0.80, (decks, dealt))
+
+    def test_low_deck_shoe_flags_reshuffle_before_running_dry(self):
+        for decks in (1, 2):
+            shoe = Shoe(decks)
+            dealt = 0
+            while not shoe.reshuffle_needed:
+                shoe.deal()
+                dealt += 1
+            self.assertGreater(len(shoe.cards), 0, decks)
+            self.assertLess(dealt, decks * 52)
+
+    def test_snapshot_dict_roundtrip(self):
+        shoe = Shoe(2)
+        for _ in range(30):
+            shoe.deal()
+        again = Shoe.from_dict(shoe.to_dict())
+        self.assertEqual(again.to_dict(), shoe.to_dict())
+
+    def test_rebuild_without_excludes_cards_in_play(self):
+        shoe = Shoe(1)
+        in_play = [Card('A', '♠'), Card('K', '♥'), Card('7', '♦')]
+        shoe.rebuild_without(in_play)
+        self.assertEqual(len(shoe.cards), 49)
+        names = {str(c) for c in shoe.cards}
+        self.assertFalse(names & {"A♠", "K♥", "7♦"})
 
     def test_reshuffle_flag_and_rebuild(self):
         shoe = Shoe(6)
@@ -659,23 +695,19 @@ class TestBasicStrategy(unittest.TestCase):
 # =====================================================================
 
 class TestSnapshotRoundTrip(unittest.TestCase):
-    """The persisted snapshot must rebuild an equivalent table.
+    """to_snapshot -> JSON (as stored in Postgres) -> from_snapshot must rebuild
+    an IDENTICAL table — shoe, count, insurance and pending mistakes included
+    (REVIEW E4, QA B3/B4). No fields are excluded from the comparison."""
 
-    The shoe itself is intentionally NOT persisted (rooms rebuild from the DB),
-    so cardCounting.remainingCards / trueCount and shoePendingShuffle are
-    excluded from the comparison — see QA_FINDINGS.md.
-    """
-
-    # fields that depend on the (non-persisted) live shoe
-    _VOLATILE = {"cardCounting", "shoePendingShuffle"}
-
-    def _curated(self, snap):
-        return {k: v for k, v in snap.items() if k not in self._VOLATILE}
+    @staticmethod
+    def _via_db(snap):
+        return json.loads(json.dumps(snap))
 
     def _assert_roundtrip(self, table):
-        snap = table.to_json()
-        rebuilt = Table.from_snapshot(snap).to_json()
-        self.assertEqual(self._curated(rebuilt), self._curated(snap))
+        snap = self._via_db(table.to_snapshot())
+        rebuilt = Table.from_snapshot(snap)
+        self.assertEqual(self._via_db(rebuilt.to_snapshot()), snap)
+        return rebuilt
 
     def test_roundtrip_betting(self):
         t = Table()
@@ -703,6 +735,113 @@ class TestSnapshotRoundTrip(unittest.TestCase):
         t.execute_action("P", "stand")
         self.assertEqual(t.game_state, "game_over")
         self._assert_roundtrip(t)
+
+    def test_roundtrip_pending_shuffle(self):
+        t = Table(settings={"numDecks": 1})
+        t.add_player("P", [1], 100, 0, 0, current_balance=5000)
+        while not t.shoe.reshuffle_needed:
+            t.shoe.deal()
+        r = self._assert_roundtrip(t)
+        self.assertTrue(r.to_json()["shoePendingShuffle"])
+
+    def test_multi_seat_player_stays_one_player(self):
+        t = Table()
+        t.add_player("A", [1, 2], 100, 0, 0, current_balance=5000)
+        _stack(t, [('9', '♠'), ('8', '♠'), ('6', '♥'),
+                   ('7', '♦'), ('7', '♣'), ('K', '♦')])
+        t.deal_initial()
+        r = self._assert_roundtrip(t)
+        self.assertIs(r.seats[0].player, r.seats[1].player)
+        self.assertEqual(len(r.get_unique_players()), 1)
+        self.assertEqual(r.seats[0].player.balance, 4800)
+        # Finishing the round pays into ONE balance, exactly as the original.
+        for tbl in (t, r):
+            tbl.execute_action("A", "stand")
+            tbl.execute_action("A", "stand")
+        self.assertEqual(r.to_json(), t.to_json())
+
+    def test_insurance_bet_survives_restore_and_pays(self):
+        # QA B3: insurance_bet used to be dropped on restore, forfeiting 2:1.
+        t = Table()
+        t.add_player("A", [1], 100, 0, 0, current_balance=5000)
+        t.add_player("B", [2], 100, 0, 0, current_balance=5000)
+        # deal order: s1, s2, dealer, s1, s2, dealer  (dealer A + K = blackjack)
+        _stack(t, [('10', '♠'), ('10', '♥'), ('A', '♣'),
+                   ('10', '♦'), ('7', '♠'), ('K', '♠')])
+        t.deal_initial()
+        t.buy_insurance(1, True)            # seat 2 still undecided
+        r = self._assert_roundtrip(t)
+        self.assertEqual(r.seats[0].insurance_bet, 50)
+        self.assertEqual(r.game_state, "insurance")
+        r.buy_insurance(1, True)            # already decided: ignored
+        self.assertEqual(r.seats[0].player.balance, 5000 - 100 - 50)
+        r.buy_insurance(2, False)
+        self.assertEqual(r.game_state, "game_over")
+        self.assertEqual(r.seats[0].player.balance, 5000 - 100 - 50 + 150)
+
+    def test_restored_table_plays_on_identically(self):
+        # The shoe is persisted, so both tables draw the same cards.
+        import random
+        random.seed(11)
+        t = Table()
+        t.add_player("P", [1, 2], 100, 0, 0, current_balance=100000)
+        t.deal_initial()
+        for n in (1, 2):
+            t.buy_insurance(n, False)       # no-op unless insurance is open
+        r = Table.from_snapshot(self._via_db(t.to_snapshot()))
+        for tbl in (t, r):
+            while tbl.game_state == "playing":
+                seat = tbl.seats[tbl.active_seat_numbers[tbl.current_seat_turn_idx] - 1]
+                hand = seat.hands[tbl.current_hand_idx]
+                tbl.execute_action("P", "hit" if hand.total() < 17 else "stand")
+        self.assertEqual(r.to_snapshot(), t.to_snapshot())
+
+    def test_pending_mistakes_survive_restore(self):
+        t, seat = seat_and_deal(
+            player_cards=[('8', '♠'), ('8', '♥')],
+            dealer_cards=[('10', '♣'), ('7', '♦')],
+            rest=[('8', '♦'), ('9', '♣')],
+            bet=100, balance=10000,
+        )
+        t.execute_action("P", "split")
+        t.execute_action("P", "stand")             # 8,8 -> 16 vs 10: book HIT
+        self.assertEqual(len(seat.hands[0].pending_mistakes), 1)
+        r = self._assert_roundtrip(t)
+        self.assertEqual(len(r.seats[0].hands[0].pending_mistakes), 1)
+        r.execute_action("P", "stand")             # 8,9 = 17: correct
+        self.assertEqual(r.game_state, "game_over")
+        self.assertEqual(len(r.round_mistakes), 1)
+
+    def test_unsplit_ace_pair_stays_playable_after_restore(self):
+        # from_snapshot used to mark ANY A,A hand as split aces (frozen).
+        t, seat = seat_and_deal(
+            player_cards=[('A', '♠'), ('A', '♥')],
+            dealer_cards=[('9', '♣'), ('7', '♦')],
+            bet=100, balance=10000,
+        )
+        r = self._assert_roundtrip(t)
+        self.assertFalse(r.seats[0].hands[0].from_split_aces)
+        self.assertTrue(r.to_json()["seats"][0]["hands"][0]["canSplit"])
+
+    def test_public_view_never_exposes_the_shoe(self):
+        t = Table()
+        t.add_player("P", [1], 100, 0, 0, current_balance=5000)
+        snap = t.to_snapshot()
+        self.assertIn(Table.PRIVATE_KEY, snap)
+        self.assertNotIn(Table.PRIVATE_KEY, t.to_json())
+        self.assertEqual(Table.public_view(snap), t.to_json())
+
+    def test_legacy_snapshot_without_shoe_resets_the_count(self):
+        # An old to_json()-only snapshot has no shoe: a fresh shoe => count 0.
+        t, seat = seat_and_deal(
+            player_cards=[('5', '♠'), ('6', '♥')],
+            dealer_cards=[('4', '♣'), ('3', '♦')],
+            bet=100, balance=10000,
+        )
+        self.assertEqual(t.running_count, 4)
+        r = Table.from_snapshot(self._via_db(t.to_json()))
+        self.assertEqual(r.running_count, 0)
+        self.assertEqual(len(r.shoe.cards), 312)
 
 
 # =====================================================================
@@ -885,54 +1024,276 @@ class TestFrontendStrategySync(unittest.TestCase):
 
 
 # =====================================================================
-# 15. KNOWN ENGINE BUGS — reported in QA_FINDINGS.md, intentionally NOT fixed
-#     by QA. Each is marked expectedFailure so the suite stays green today and
-#     turns into an "unexpected success" (loud) the moment Engine fixes it —
-#     at which point simply delete the decorator.
+# 15. Phase 1 engine fixes (REVIEW §1.2 / QA_FINDINGS §3). These replace the
+#     former TestKnownBugs expected-failures and fold in the useful probes
+#     from review_harness/probes.py.
 # =====================================================================
 
-class TestKnownBugs(unittest.TestCase):
+def _two_seat_insurance_table():
+    """A on seat 1, B on seat 2, dealer shows an Ace (no blackjack)."""
+    t = Table()
+    t.add_player("A", [1], 100, 0, 0, current_balance=5000)
+    t.add_player("B", [2], 100, 0, 0, current_balance=5000)
+    # deal order: s1, s2, dealer, s1, s2, dealer
+    _stack(t, [('9', '♠'), ('9', '♥'), ('A', '♠'),
+               ('7', '♦'), ('7', '♣'), ('6', '♦')])
+    t.deal_initial()
+    return t
 
-    @unittest.expectedFailure
-    def test_BUG_low_deck_shoe_must_flag_reshuffle_before_running_dry(self):
-        # cut_card_position = len - randint(104,156) is <= 0 for 1 and 2 decks,
-        # so reshuffle_needed never fires; the shoe empties MID-ROUND and
-        # silently rebuilds (impossible duplicate cards, count not reset).
-        for decks in (1, 2):
-            for _ in range(20):
-                shoe = Shoe(decks)
-                self.assertGreater(shoe.cut_card_position, 0,
-                                   f"{decks}-deck shoe has no usable cut card")
 
-    @unittest.expectedFailure
-    def test_BUG_rejected_actions_are_not_strategy_mistakes(self):
-        # execute_action records a "mistake" BEFORE validating the action, so an
-        # illegal split (non-pair) or a junk verb pollutes the review screen.
+class TestInsuranceDecisions(unittest.TestCase):
+    """REVIEW E2/E3: exactly one insurance decision per seat in the round."""
+
+    def test_insurance_cannot_be_bought_twice(self):
+        t = _two_seat_insurance_table()
+        self.assertEqual(t.game_state, "insurance")
+        for _ in range(3):
+            t.buy_insurance(1, True)
+        self.assertEqual(t.seats[0].player.balance, 5000 - 100 - 50)
+        self.assertEqual(t.seats[0].insurance_bet, 50)
+        self.assertEqual(t.game_state, "insurance")   # still waiting on B
+
+    def test_decision_cannot_be_changed(self):
+        t = _two_seat_insurance_table()
+        t.buy_insurance(1, False)
+        t.buy_insurance(1, True)
+        self.assertEqual(t.seats[0].insurance_bet, 0)
+        self.assertEqual(t.seats[0].player.balance, 5000 - 100)
+
+    def test_seat_not_in_round_cannot_close_insurance(self):
+        t = _two_seat_insurance_table()
+        t.buy_insurance(1, False)
+        t.buy_insurance(5, False)                     # empty seat
+        t.buy_insurance(5, True)                      # used to raise
+        t.buy_insurance(0, False)
+        t.buy_insurance("x", False)
+        self.assertEqual(t.game_state, "insurance")
+        self.assertNotIn("5", t.insurance_responses)
+        t.buy_insurance(2, False)
+        self.assertEqual(t.game_state, "playing")
+
+    def test_numeric_string_seat_accepted(self):
+        t = _two_seat_insurance_table()
+        t.buy_insurance("1", True)
+        self.assertEqual(t.seats[0].insurance_bet, 50)
+
+    def test_unaffordable_insurance_counts_as_declined(self):
+        t = Table()
+        t.add_player("P", [1], 100, 0, 0, current_balance=120)
+        _stack(t, [('9', '♠'), ('A', '♠'), ('7', '♦'), ('6', '♦')])
+        t.deal_initial()                              # balance 20 < 50
+        t.buy_insurance(1, True)
+        self.assertEqual(t.seats[0].insurance_bet, 0)
+        self.assertEqual(t.seats[0].player.balance, 20)
+        self.assertIs(t.insurance_responses["1"], False)
+        self.assertEqual(t.game_state, "playing")
+
+
+class TestMistakeTracking(unittest.TestCase):
+    """REVIEW E8 / QA B2: only legal, performed actions are graded, and they
+    are graded against the best LEGAL play."""
+
+    def _mistakes(self, seat):
+        return [m["user_action"] for m in getattr(seat.hands[0], "pending_mistakes", [])]
+
+    def test_rejected_actions_are_not_strategy_mistakes(self):
         t, seat = seat_and_deal(
             player_cards=[('10', '♠'), ('7', '♥')],
             dealer_cards=[('9', '♣'), ('8', '♦')],
             rest=[('2', '♠')] * 5,
         )
-        t.execute_action("P", "split")      # illegal: not a pair -> no-op
-        t.execute_action("P", "banana")     # nonsense verb -> no-op
-        self.assertEqual(getattr(seat.hands[0], "pending_mistakes", []), [])
+        for bad in ("split", "banana", "surrender", "", None):
+            t.execute_action("P", bad)      # not legal -> no-op
+        self.assertEqual(self._mistakes(seat), [])
+        self.assertEqual(len(seat.hands[0].cards), 2)
+        self.assertEqual(t.game_state, "playing")
 
-    @unittest.expectedFailure
-    def test_BUG_insurance_bet_survives_snapshot_restore(self):
-        # from_snapshot never restores seat.insurance_bet. The stake was already
-        # deducted, so a restart mid-insurance forfeits the 2:1 payout.
+    def test_unaffordable_double_is_rejected_and_not_graded(self):
+        t, seat = seat_and_deal(
+            player_cards=[('6', '♠'), ('5', '♥')],    # 11 vs 9: book DOUBLE
+            dealer_cards=[('9', '♣'), ('8', '♦')],
+            rest=[('K', '♣')],
+            bet=100, balance=150,                     # 50 left: can't double
+        )
+        t.execute_action("P", "double")
+        self.assertEqual(len(seat.hands[0].cards), 2)
+        self.assertEqual(seat.hands[0].bet, 100)
+        self.assertEqual(self._mistakes(seat), [])
+        # Hitting is the best legal play now, so it is not a mistake either.
+        t.execute_action("P", "hit")
+        self.assertEqual(self._mistakes(seat), [])
+
+    def test_hitting_three_card_eleven_is_not_a_mistake(self):
+        t, seat = seat_and_deal(
+            player_cards=[('5', '♠'), ('2', '♥')],    # 7 vs 10: hit
+            dealer_cards=[('10', '♣'), ('9', '♦')],
+            rest=[('4', '♣'), ('K', '♠')],            # -> 11 on three cards
+        )
+        t.execute_action("P", "hit")
+        self.assertEqual(seat.hands[0].total(), 11)
+        self.assertEqual(t.to_json()["learnerPanel"]["suggestion"], "HIT")
+        t.execute_action("P", "hit")
+        self.assertEqual(self._mistakes(seat), [])
+
+    def test_standing_three_card_soft_18_is_not_a_mistake(self):
+        t, seat = seat_and_deal(
+            player_cards=[('A', '♠'), ('2', '♥')],    # soft 13 vs 4: hit
+            dealer_cards=[('4', '♣'), ('10', '♦')],
+            rest=[('5', '♣')],                        # -> soft 18, three cards
+        )
+        t.execute_action("P", "hit")
+        self.assertEqual(t.to_json()["learnerPanel"]["suggestion"], "STAND")
+        t.execute_action("P", "stand")
+        self.assertEqual(self._mistakes(seat), [])
+
+    def test_real_mistake_is_still_recorded(self):
+        t, seat = seat_and_deal(
+            player_cards=[('10', '♠'), ('6', '♥')],   # 16 vs 10: book HIT
+            dealer_cards=[('10', '♣'), ('7', '♦')],
+        )
+        t.execute_action("P", "stand")
+        self.assertEqual(t.game_state, "game_over")
+        self.assertEqual([m["user_action"] for m in t.round_mistakes], ["STAND"])
+
+
+class TestShoePenetration(unittest.TestCase):
+    """REVIEW E5/E6, QA B1: small shoes reshuffle on time, never deal an
+    impossible card, and the count always matches the shoe."""
+
+    @staticmethod
+    def _cards_on_table(t):
+        return [str(c) for c in t._cards_in_play()]
+
+    def _play_rounds(self, decks, rounds, seed):
+        import random
+        from collections import Counter
+        from game import hi_lo
+        random.seed(seed)
+        t = Table({"numDecks": decks}, is_solo=True)
+        shuffles = 0
+        for _ in range(rounds):
+            t.add_player("P", list(range(1, 8)), 100, 0, 0, current_balance=10 ** 9)
+            t.deal_initial()
+            shuffles += any(l.startswith("Shoe reshuffled") for l in t.logs)
+            for n in range(1, 8):
+                t.buy_insurance(n, False)
+            guard = 0
+            while t.game_state == "playing" and guard < 500:
+                guard += 1
+                seat = t.seats[t.active_seat_numbers[t.current_seat_turn_idx] - 1]
+                hand = seat.hands[t.current_hand_idx]
+                act = "split" if hand.can_split() else ("hit" if hand.total() < 15 else "stand")
+                if act == "split" and "split" not in t._legal_actions(seat, hand):
+                    act = "hit"
+                t.execute_action("P", act)
+            self.assertEqual(t.game_state, "game_over")
+            worst = max(Counter(self._cards_on_table(t)).values())
+            self.assertLessEqual(worst, decks, "impossible duplicate card on the table")
+            # Hi-Lo is balanced: count + count of what's left in the shoe == 0.
+            self.assertEqual(t.running_count + sum(hi_lo(c) for c in t.shoe.cards), 0)
+            t.reset_round()
+        return shuffles
+
+    def test_one_deck_full_table(self):
+        self.assertGreater(self._play_rounds(1, 300, seed=3), 100)
+
+    def test_two_decks_full_table(self):
+        self.assertGreater(self._play_rounds(2, 300, seed=5), 50)
+
+    def test_six_decks_reshuffles_at_about_75_percent(self):
+        import random
+        random.seed(8)
+        t = Table(is_solo=True)
+        dealt_at_shuffle = []
+        for _ in range(400):
+            t.add_player("P", [1, 2, 3], 100, 0, 0, current_balance=10 ** 9)
+            before = len(t.shoe.cards)
+            t.deal_initial()
+            if any(l.startswith("Shoe reshuffled") for l in t.logs):
+                dealt_at_shuffle.append(312 - before)
+            for n in (1, 2, 3):
+                t.buy_insurance(n, False)
+            while t.game_state == "playing":
+                t.execute_action("P", "stand")
+            t.reset_round()
+        self.assertTrue(dealt_at_shuffle)
+        for dealt in dealt_at_shuffle:
+            self.assertTrue(0.70 * 312 <= dealt <= 0.85 * 312, dealt)
+
+    def test_mid_round_exhaustion_reshuffles_discards_only(self):
+        from game import hi_lo
+        t, seat = seat_and_deal(
+            player_cards=[('5', '♠'), ('2', '♥')],
+            dealer_cards=[('10', '♣'), ('9', '♦')],
+            settings={"numDecks": 1},
+        )
+        t.shoe.cards = []                    # force the shoe dry mid-round
+        t.execute_action("P", "hit")
+        self.assertIn("Shoe exhausted — discards reshuffled.", t.logs)
+        on_table = self._cards_on_table(t)
+        self.assertEqual(len(t.shoe.cards) + len(on_table), 52)
+        self.assertFalse({str(c) for c in t.shoe.cards} & set(on_table))
+        self.assertEqual(t.running_count + sum(hi_lo(c) for c in t.shoe.cards), 0)
+
+    def test_short_shoe_flags_pending_shuffle_before_next_deal(self):
+        t = Table(settings={"numDecks": 1}, is_solo=True)
+        t.add_player("P", list(range(1, 8)), 10, 0, 0, current_balance=10 ** 6)
+        t.shoe.cards = t.shoe.cards[:20]     # 20 < (7 seats + dealer) * 4
+        t.shoe.cut_card_position = 0
+        t.game_state = "game_over"
+        t.reset_round()
+        self.assertTrue(t.to_json()["shoePendingShuffle"])
+
+
+class TestTurnOwnership(unittest.TestCase):
+    """probes.py §10: the engine enforces whose turn it is."""
+
+    def _table(self):
         t = Table()
-        t.add_player("A", [1], 100, 0, 0)
-        t.add_player("B", [2], 100, 0, 0)
-        # deal order: s1, s2, dealer, s1, s2, dealer  (dealer shows Ace)
-        _stack(t, [('10', '♠'), ('10', '♥'), ('A', '♣'),
-                   ('10', '♦'), ('7', '♠'), ('6', '♠')])
+        t.add_player("A", [1], 100, 0, 0, current_balance=5000)
+        t.add_player("B", [2], 100, 0, 0, current_balance=5000)
+        _stack(t, [('9', '♠'), ('9', '♥'), ('7', '♠'),
+                   ('7', '♦'), ('7', '♣'), ('K', '♦')])
         t.deal_initial()
-        self.assertEqual(t.game_state, "insurance")
-        t.buy_insurance(1, True)            # seat 2 still undecided
-        self.assertEqual(t.seats[0].insurance_bet, 50)
-        restored = Table.from_snapshot(t.to_json())
-        self.assertEqual(restored.seats[0].insurance_bet, 50)
+        return t
+
+    def test_other_player_cannot_act_on_your_turn(self):
+        t = self._table()
+        t.execute_action("B", "stand")
+        self.assertEqual(t.current_seat_turn_idx, 0)
+        self.assertEqual(getattr(t.seats[0].hands[0], "pending_mistakes", []), [])
+
+    def test_cannot_leave_mid_round(self):
+        t = self._table()
+        t.leave_player("A")
+        self.assertTrue(t.seats[0].occupied)
+
+
+class TestRoomPersistence(unittest.TestCase):
+    """app.py stores the full snapshot but never serves the shoe over REST."""
+
+    def setUp(self):
+        self.app = _import_app()
+        if self.app is None:
+            self.skipTest("app.py (web deps) unavailable")
+
+    def test_user_rooms_endpoint_strips_private_block(self):
+        app = self.app
+        t = Table()
+        t.add_player("ShoeLeakCheck", [1], 100, 0, 0, current_balance=5000)
+        with app.app.app_context():
+            app.db.session.add(app.GameRoom(id="ZZLEAK", state=t.to_snapshot()))
+            app.db.session.commit()
+            try:
+                resp = app.app.test_client().get("/api/rooms/ShoeLeakCheck")
+                rooms = resp.get_json()["rooms"]
+                self.assertEqual(len(rooms), 1)
+                self.assertNotIn(Table.PRIVATE_KEY, rooms[0]["state"])
+                restored = Table.from_snapshot(app.GameRoom.query.get("ZZLEAK").state)
+                self.assertEqual(restored.shoe.to_dict(), t.shoe.to_dict())
+            finally:
+                app.GameRoom.query.filter_by(id="ZZLEAK").delete()
+                app.db.session.commit()
 
 
 class TestInputValidation(unittest.TestCase):

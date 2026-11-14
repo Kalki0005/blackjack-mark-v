@@ -5,7 +5,8 @@ is a negotiated edit announced to all departments — never a silent drift.** Ba
 server side of these; Frontend/3D code against them; a new field is additive and
 back-compatible unless called out.
 
-Verified against code Nov 2026 (`backend/app.py`, `backend/game.py` `to_json`).
+Verified against code Nov 2026 (`backend/app.py`, `backend/game.py` `to_json`/`to_snapshot`);
+Phase 1 engine fixes (E2–E6, E8) reflected.
 
 ---
 
@@ -20,8 +21,8 @@ Socket.IO, default namespace. Server replies by broadcasting `state_update` to t
 | `sit_player` | `{room, username, seats:[int], main_bet, pp_bet, t3_bet}` | Locks bets; cap 3 seats/player in rooms, uncapped solo. Validated: ints, `main_bet > 0`, side bets ≥ 0, unique seats in 1..7. |
 | `leave_table` | `{room, username}` | Only during `betting`. |
 | `execute_deal` | `{room, cut?}` | `cut` 0.05–0.95 cut fraction (math-neutral rotation) when a shuffle is pending. |
-| `submit_action` | `{room, username, action}` | `action ∈ {hit, stand, double, split}`. Server checks the *named* user owns the turn — but `username` is client-supplied (no auth yet, see §8). |
-| `buy_insurance` | `{room, seat_number, wants_insurance}` | Intended one per active seat; **not yet enforced** (REVIEW E2/E3). |
+| `submit_action` | `{room, username, action}` | `action ∈ {hit, stand, double, split}`. Server checks the *named* user owns the turn — but `username` is client-supplied (no auth yet, see §8). Anything not legal for the hand right now (unknown verb, split on a non-pair or at 4 hands, double on 3+ cards or unaffordable) is a silent no-op and is **not** graded as a strategy mistake. Mistakes are graded against the best *legal* play ("double" unavailable → hit, or stand on soft 18/19). |
+| `buy_insurance` | `{room, seat_number, wants_insurance}` | Exactly one decision per seat **in the round**; repeats and seats not in `activeSeatNumbers` are ignored. Unaffordable insurance counts as declined. The phase closes once every active seat has decided. (Seat ownership is not checked — no auth yet, §8.) |
 | `clear_round` | `{room}` | Reset to `betting` for the next round. |
 | `reload_bankroll` | `{room, username}` | Tops balance up to $5,000 (only raises). |
 
@@ -52,7 +53,7 @@ The single source of truth the frontend renders. Shape:
   activeSeatNumbers: [int], activeSeatTurnIdx, activeHandIndex,
   seats: [{
     number, isOccupied, playerName, balance,
-    bet, ppBet, t3Bet,
+    bet, ppBet, t3Bet, insuranceBet,   // insuranceBet: 0 unless bought this round
     ppDisplay, t3Display,            // total return if resolved, else the stake
     sidebetResults: {pp, t3},        // null=unresolved, 0=lost, >0=total returned
     isActiveTurn, insuranceDecisionMade,
@@ -78,6 +79,15 @@ mistake = {player_total, dealer_upcard, user_action, recommended_action,
            is_soft, is_pair, cards:[str], hand_outcome?, username?}
 ```
 Card string = rank+suit, e.g. `"A♠"`, `"10♥"`. Suits: ♠♥♦♣.
+
+**Persisted snapshot (`Table.to_snapshot()`, server-only).** `GameRoom.state` stores the §4
+snapshot **plus** a private `engine` block: `{shoe:{numDecks, cards:[str], cutCardPosition,
+reshuffleNeeded}, insuranceResponses:{"<seat>":bool}, readyPlayers:[str],
+pendingMistakes:{"<seat>":[[mistake]...per hand]}}`. `from_snapshot(to_snapshot())`
+round-trips exactly (one `Player` per name across seats, insurance bet, shoe and count).
+The `engine` block holds the **future card order** — never send it to a client; REST
+uses `Table.public_view()`. Legacy snapshots without it restore with a fresh shoe and
+`runningCount` 0.
 
 ## 5. Settings schema (`Table._normalize_settings`)
 ```
@@ -114,6 +124,11 @@ map onto hit/stand/double or new verbs — decide at build time, document here).
   (doubles/splits lost to a late dealer BJ stay lost) — intentional, do not "fix".
 - Split aces: one card each, auto-stand, 21 is **not** blackjack (pays 1:1).
 - Blackjack only on the initial 2 cards, never after split.
+- Shoe: cut card at ~75% penetration (72–78% dealt, any deck count). A round only starts
+  with ≥ (seats+1)×4 cards left, else the shoe is reshuffled first (`shoePendingShuffle`
+  is raised at `clear_round`). If a shoe still runs dry mid-round, only the discards are
+  reshuffled (never a card on the table) and the count restarts from the cards in play.
+  Hi-Lo invariant: `runningCount` + Hi-Lo sum of the cards left in the shoe = 0.
 
 ## 8. Known gaps (fix in Phase 3 — do not build on these as if they were true)
 - **No authentication.** `username` in every socket event and REST write is trusted as sent.
@@ -121,6 +136,6 @@ map onto hit/stand/double or new verbs — decide at build time, document here).
   client just hides it. Same for `learnerPanel` (broadcast to the whole room).
 - **Silent failures:** only `join_room` emits `error`; other rejections just append a log line.
 - **`playerStats` is usually `{}`** on the wire (cleared before broadcast); stats come from REST.
-- **Settings are not fully validated** (string fields accept anything); `numDecks` 1 and 2
-  are broken until E5/B1 is fixed; `countVisibility: "hover"` is unimplemented.
+- **Settings are not fully validated** (string fields accept anything);
+  `countVisibility: "hover"` is unimplemented. (`numDecks` 1/2 fixed in Phase 1.)
 - **`dealer_turn` is never observed** by clients: the dealer plays out inside one call.
