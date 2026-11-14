@@ -235,6 +235,23 @@ class Table:
         if self.game_state != "betting":
             return
 
+        # Input validation (REVIEW E1/E7): bets and seats come straight from the
+        # client. A negative side bet used to be deducted as a negative cost,
+        # minting chips; out-of-range seats wrapped (seat 0 -> seat 7) or crashed.
+        try:
+            main_bet, pp_bet, t3_bet = int(main_bet), int(pp_bet), int(t3_bet)
+            seat_numbers = [int(n) for n in seat_numbers]
+        except (TypeError, ValueError):
+            self.log("Invalid bet or seat.")
+            return
+        if main_bet <= 0 or pp_bet < 0 or t3_bet < 0:
+            self.log("Bets must be positive.")
+            return
+        if not seat_numbers or len(set(seat_numbers)) != len(seat_numbers) or \
+                any(not 1 <= n <= len(self.seats) for n in seat_numbers):
+            self.log("Invalid seat selection.")
+            return
+
         # Cap applies to multiplayer rooms only — solo play is uncapped.
         if not self.is_solo:
             already_held = {s.number for s in self.seats

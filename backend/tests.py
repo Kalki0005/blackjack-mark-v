@@ -935,5 +935,43 @@ class TestKnownBugs(unittest.TestCase):
         self.assertEqual(restored.seats[0].insurance_bet, 50)
 
 
+class TestInputValidation(unittest.TestCase):
+    """REVIEW E1/E7: client-supplied bets and seats must be validated."""
+
+    def _table(self):
+        return Table(settings={"numDecks": 6}, is_solo=True)
+
+    def test_negative_side_bet_cannot_mint_chips(self):
+        t = self._table()
+        t.add_player("P", [4], 100, -900000, 0, current_balance=5000)
+        self.assertFalse(t.seats[3].occupied)
+        t.deal_initial()  # nothing to deal; balance must be untouched
+        self.assertEqual([p.balance for p in t.get_unique_players()], [])
+
+    def test_zero_or_negative_main_bet_rejected(self):
+        for bad in (0, -50):
+            t = self._table()
+            t.add_player("P", [4], bad, 0, 0)
+            self.assertFalse(t.seats[3].occupied)
+
+    def test_out_of_range_and_duplicate_seats_rejected(self):
+        for seats in ([0], [8], [3, 3], []):
+            t = self._table()
+            t.add_player("P", seats, 100, 0, 0)
+            self.assertFalse(any(s.occupied for s in t.seats), seats)
+
+    def test_non_numeric_input_rejected_without_crashing(self):
+        t = self._table()
+        t.add_player("P", [4], "abc", 0, 0)
+        t.add_player("P", ["x"], 100, 0, 0)
+        self.assertFalse(any(s.occupied for s in t.seats))
+
+    def test_numeric_strings_still_accepted(self):
+        t = self._table()
+        t.add_player("P", ["4"], "100", "10", "0", current_balance=5000)
+        self.assertTrue(t.seats[3].occupied)
+        self.assertEqual(t.seats[3].bet, 100)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
