@@ -12,7 +12,9 @@ for whatever rules you are playing, and a chess.com-style post-game review.
 ## Principles
 
 1. **Correct before pretty.** The teaching layer must be right for the rules being played.
-2. **Ship early.** A deployed link is worth more than an unshipped feature.
+2. **Build the ideal version first; shipping is optional.** The owner wants to finish the
+   full vision before deploying. Keeping the 2D game shippable at all times is the fallback,
+   not a deadline. The code lives on GitHub (`Kalki0005/blackjack-mark-v`) throughout.
 3. **Tests are the contract.** `backend/tests.py` + `backend/sim.py` must pass before any
    merge. Run `sim.py` after any change to money paths.
 4. **Two work streams at most**, on branches, with files that do not overlap:
@@ -54,7 +56,9 @@ for whatever rules you are playing, and a chess.com-style post-game review.
 - Frontend: remove hardcoded `localhost:5000`, delete dead table/3D files and the
   ~180 MB of unused assets, split `App.jsx`.
 
-### Phase 4 — Ship the 2D game
+### Phase 4 — Ship the 2D game  *(deferred — optional fallback, owner's call)*
+- Not a priority: the owner builds the ideal version first. Kept here so the 2D game stays
+  deployable if the 3D direction disappoints.
 - Deploy (cheap domain). 60–90 s demo video.
 - Launch on the hook that already exists: *chess.com-style game review for blackjack*.
 - Watch what players actually use and ask for.
@@ -62,7 +66,7 @@ for whatever rules you are playing, and a chess.com-style post-game review.
 ### Phase 5 — Variants  *(each one = rule set + solver support + tutorial)*
 Built on the solver, so strategy and the review work for every variant from day one.
 - **Real-casino rule toggles** on classic: H17, late surrender, 6:5, DAS off, resplit
-  aces, peek vs no-peek.
+  aces, **peek on 10 (toggle; default = current no-peek-on-10 rule — decided Nov 2026)**.
 - **Spanish 21** — 48-card decks (no 10 pips), player 21 always wins, bonus 21 payouts,
   late surrender, redouble. Strategy depends on card count in hand.
 - **Pontoon** — both regional forms (see below). Needs new *behaviour*, not just flags.
@@ -72,10 +76,12 @@ Built on the solver, so strategy and the review work for every variant from day 
 - **Infinite / common-draw blackjack** (Evolution-style shared hand) — fits rooms well.
 - "Play Classic / Play Other Modes" menu; per-variant interactive tutorial in the Hub.
 
-> **Pontoon means two different games.** *British Pontoon*: both dealer cards face down,
-> twist/stick/buy, five-card trick, pontoon pays 2:1, dealer wins ties. *Asian/Australian
-> casino Pontoon*: much closer to Spanish 21. Confirm which one Genting Highlands deals
-> (was a dealer card face up? were the 10s removed?) and build that one first.
+> **Pontoon — decided:** build the **Asian casino Pontoon** first (what the owner played at
+> Genting Highlands): regular blackjack play with the 10-pip cards removed (Spanish deck) and
+> a better blackjack payout. Model it as a Spanish-21-family ruleset with configurable
+> payouts/bonuses; verify exact Genting rules (BJ payout, 5-card bonuses, dealer S17/H17,
+> peek) from published sources before locking numbers. British Pontoon (both dealer cards
+> down, twist/stick/buy, five-card trick) comes later.
 
 ### Phase 6 — Dealer and premium presentation
 - Engine first emits an **ordered event list** (card to seat 3, hole card revealed, hand
