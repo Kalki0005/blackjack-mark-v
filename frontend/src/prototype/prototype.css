@@ -1,0 +1,34 @@
+.proto { position: fixed; inset: 0; background: #05070a; color: #f3ead6; font-family: 'Segoe UI', system-ui, sans-serif; user-select: none; }
+.proto canvas { display: block; }
+.vignette { position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 45%, transparent 52%, rgba(0, 0, 0, 0.62) 100%); }
+
+.badge { min-width: 26px; padding: 2px 6px; border-radius: 999px; text-align: center; font: 700 14px/18px 'Segoe UI', sans-serif;
+  color: #fff; background: rgba(10, 14, 18, 0.82); border: 1.5px solid rgba(236, 205, 140, 0.9); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); }
+.badge.bust { border-color: #e2504c; color: #ff9c98; }
+.badge.dealer { border-color: #9fd8e6; }
+.bet { padding: 1px 7px; border-radius: 6px; font: 600 12px/16px 'Segoe UI', sans-serif; color: #f6e3b0; background: rgba(0, 0, 0, 0.55); }
+.status { padding: 3px 10px; border-radius: 6px; font: 800 13px/16px 'Segoe UI', sans-serif; letter-spacing: 0.08em; color: #10151a;
+  background: #ecd08c; box-shadow: 0 3px 12px rgba(0, 0, 0, 0.55); white-space: nowrap; animation: pop 0.18s ease-out; }
+.status.bust, .status.lose { background: #e2504c; color: #fff; }
+.status.win, .status.blackjack { background: #38c172; color: #04130a; }
+.status.push { background: #9fb3c1; }
+@keyframes pop { from { transform: scale(0.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+.caption { position: absolute; left: 50%; bottom: 13%; transform: translateX(-50%); padding: 8px 18px; border-radius: 10px;
+  background: rgba(6, 10, 14, 0.78); border: 1px solid rgba(236, 205, 140, 0.35); font-size: 17px; white-space: nowrap; pointer-events: none; }
+.caption span { margin-right: 10px; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #ecd08c; }
+
+.start { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: rgba(3, 5, 8, 0.55); backdrop-filter: blur(3px); text-align: center; padding: 16px; }
+.start h1 { margin: 0; font: 600 34px Georgia, serif; color: #ecd08c; }
+.start p { margin: 0 0 12px; opacity: 0.8; }
+.proto button { margin: 0 4px; padding: 9px 16px; border-radius: 8px; border: 1px solid rgba(236, 205, 140, 0.55); cursor: pointer;
+  font: 600 13px 'Segoe UI', sans-serif; color: #10151a; background: #ecd08c; }
+.proto button.ghost, .controls button { color: #f3ead6; background: rgba(8, 12, 16, 0.7); }
+.proto button:disabled { opacity: 0.5; cursor: default; }
+.controls { position: absolute; right: 10px; top: 10px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.controls button { margin: 0; padding: 5px 10px; font-size: 12px; }
+.stats { position: absolute; left: 10px; top: 10px; padding: 4px 8px; border-radius: 6px; font: 12px/16px Consolas, monospace;
+  color: #bfe9c9; background: rgba(0, 0, 0, 0.55); pointer-events: none; }
+@media (max-width: 700px) { .stats { top: auto; bottom: 8px; font-size: 10px; } .caption { font-size: 14px; bottom: 16%; } }
