@@ -24,30 +24,77 @@ class Card:
         return f"{self.rank}{self.suit}"
 
 
+SUITS = ['♠', '♥', '♦', '♣']
+RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+
+
+def hi_lo(card):
+    """Hi-Lo count tag for one card."""
+    if card.rank in ('2', '3', '4', '5', '6'):
+        return 1
+    if card.rank in ('10', 'J', 'Q', 'K', 'A'):
+        return -1
+    return 0
+
+
 class Shoe:
+    # Penetration = share of the shoe dealt before the cut card comes out.
+    # A fraction (not a fixed card count) so it scales with any deck count
+    # (REVIEW E5/E6, QA B1). Jittered slightly, like a dealer placing the cut.
+    PENETRATION = 0.75
+    PENETRATION_JITTER = 0.03
+
     def __init__(self, num_decks=6):
         self.num_decks = num_decks
         self.cards = []
-        self.cut_card_position = 0
+        self.cut_card_position = 0   # cards REMAINING when the cut card is reached
         self.reshuffle_needed = False
         self.build()
 
+    def _full_deck(self):
+        return [Card(rank, suit) for _ in range(self.num_decks)
+                for suit in SUITS for rank in RANKS]
+
+    def _place_cut_card(self):
+        pen = self.PENETRATION + random.uniform(-self.PENETRATION_JITTER,
+                                                self.PENETRATION_JITTER)
+        # Always at least one card behind the cut card, so the flag can fire.
+        self.cut_card_position = max(1, len(self.cards) - int(len(self.cards) * pen))
+
     def build(self, cut_fraction=None):
-        suits = ['♠', '♥', '♦', '♣']
-        ranks = ['2','3','4','5','6','7','8','9','10','J','Q','K','A']
-        self.cards = [Card(rank, suit) for _ in range(self.num_decks)
-                      for suit in suits for rank in ranks]
+        self.cards = self._full_deck()
         random.shuffle(self.cards)
         # Player cut: rotate the shuffled shoe at the chosen point. Purely a
         # rotation of an already-uniform shuffle — game math is unaffected.
         if cut_fraction is not None:
             k = int(len(self.cards) * min(max(float(cut_fraction), 0.05), 0.95))
             self.cards = self.cards[k:] + self.cards[:k]
-        self.cut_card_position = len(self.cards) - random.randint(104, 156)
+        self._place_cut_card()
+        self.reshuffle_needed = False
+
+    def rebuild_without(self, in_play):
+        """Emergency mid-round reshuffle: shuffle every card that is NOT on
+        the table (i.e. the discards plus what was left). Never duplicates a
+        card that is in play. The cut card is placed as usual."""
+        remaining = {}
+        for c in in_play:
+            remaining[(c.rank, c.suit)] = remaining.get((c.rank, c.suit), 0) + 1
+        cards = []
+        for c in self._full_deck():
+            key = (c.rank, c.suit)
+            if remaining.get(key):
+                remaining[key] -= 1
+            else:
+                cards.append(c)
+        random.shuffle(cards)
+        self.cards = cards
+        self._place_cut_card()
         self.reshuffle_needed = False
 
     def deal(self):
         if not self.cards:
+            # Table.deal_card handles exhaustion honestly; this is a last
+            # resort for callers using a bare Shoe.
             self.build()
         card = self.cards.pop(0)
         if len(self.cards) <= self.cut_card_position and not self.reshuffle_needed:
@@ -57,6 +104,23 @@ class Shoe:
     def reshuffle_if_needed(self, cut_fraction=None):
         if self.reshuffle_needed:
             self.build(cut_fraction)
+
+    def to_dict(self):
+        return {
+            "numDecks": self.num_decks,
+            "cards": [str(c) for c in self.cards],
+            "cutCardPosition": self.cut_card_position,
+            "reshuffleNeeded": self.reshuffle_needed,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        shoe = cls.__new__(cls)
+        shoe.num_decks = int(data.get("numDecks", 6))
+        shoe.cards = [Card(s[:-1], s[-1]) for s in data.get("cards", []) if s]
+        shoe.cut_card_position = int(data.get("cutCardPosition", 0))
+        shoe.reshuffle_needed = bool(data.get("reshuffleNeeded", False))
+        return shoe
 
 
 class Hand:
@@ -210,13 +274,36 @@ class Table:
                 "mistakes_history": []
             }
 
+    def _cards_in_play(self):
+        cards = list(self.dealer_hand.cards)
+        for seat in self.seats:
+            for h in seat.hands:
+                cards.extend(h.cards)
+        return cards
+
     def deal_card(self):
+        if not self.shoe.cards:
+            # Shoe ran dry mid-round (possible only on a very full 1-deck
+            # table). Shuffle the discards — never the cards on the table — and
+            # restart the count from what is visible in play.
+            in_play = self._cards_in_play()
+            self.shoe.rebuild_without(in_play)
+            self.running_count = sum(hi_lo(c) for c in in_play)
+            self.log("Shoe exhausted — discards reshuffled.")
         card = self.shoe.deal()
-        if card.rank in ['2', '3', '4', '5', '6']:
-            self.running_count += 1
-        elif card.rank in ['10', 'J', 'Q', 'K', 'A']:
-            self.running_count -= 1
+        self.running_count += hi_lo(card)
         return card
+
+    # Cards held back for the next round: deal a fresh shoe instead of
+    # starting a round that would likely run the shoe dry.
+    CARDS_RESERVED_PER_HAND = 4
+
+    def _cards_reserve(self, seat_count):
+        return (seat_count + 1) * self.CARDS_RESERVED_PER_HAND
+
+    def _flag_reshuffle_if_short(self, seat_count):
+        if len(self.shoe.cards) < self._cards_reserve(seat_count):
+            self.shoe.reshuffle_needed = True
 
     def get_unique_players(self):
         seen = []
@@ -340,6 +427,7 @@ class Table:
         if not self._collect_round_bets():
             return
 
+        self._flag_reshuffle_if_short(len(self.active_seat_numbers))
         if self.shoe.reshuffle_needed:
             self.running_count = 0
             self.log("Shoe reshuffled." + (" Player cut the deck." if cut_fraction is not None else ""))
@@ -440,7 +528,20 @@ class Table:
     def buy_insurance(self, seat_number, wants_insurance):
         if self.game_state != "insurance":
             return
+        # Exactly one decision per seat that is in this round (REVIEW E2/E3):
+        # a repeat call used to deduct again, and an answer for a seat not in
+        # the round could close the phase before real players decided.
+        try:
+            seat_number = int(seat_number)
+        except (TypeError, ValueError):
+            return
+        if seat_number not in self.active_seat_numbers:
+            self.log(f"S{seat_number} is not in this round.")
+            return
+        if str(seat_number) in self.insurance_responses:
+            return
         seat = self.seats[seat_number - 1]
+        wants_insurance = bool(wants_insurance)
         if wants_insurance:
             cost = seat.bet // 2
             if seat.player.can_afford(cost):
@@ -453,8 +554,8 @@ class Table:
         else:
             seat.insurance_bet = 0
 
-        self.insurance_responses[str(seat_number)] = wants_insurance
-        if len(self.insurance_responses) == len(self.active_seat_numbers):
+        self.insurance_responses[str(seat_number)] = seat.insurance_bet > 0
+        if all(str(n) in self.insurance_responses for n in self.active_seat_numbers):
             self.resolve_insurance_phase()
 
     def resolve_insurance_phase(self):
@@ -513,6 +614,34 @@ class Table:
             self.current_seat_turn_idx += 1
             self.current_hand_idx = 0
 
+    ACTIONS = ("hit", "stand", "double", "split")
+
+    @staticmethod
+    def _legal_actions(seat, hand):
+        """The moves the engine will actually perform for this hand now."""
+        legal = {"stand"}
+        if hand.from_split_aces:
+            return legal
+        legal.add("hit")
+        can_pay = seat.player.can_afford(hand.bet)
+        if len(hand.cards) == 2 and can_pay:
+            legal.add("double")
+        if len(seat.hands) < 4 and hand.can_split() and can_pay:
+            legal.add("split")
+        return legal
+
+    def _recommended_action(self, seat, hand, upcard):
+        """Basic strategy restricted to legal moves. Returns None when the
+        book play is an unavailable split (no fallback is graded then)."""
+        rec = basic_strategy(hand, upcard)
+        legal = self._legal_actions(seat, hand)
+        if rec in legal:
+            return rec
+        if rec == "double":
+            # Standard chart: soft 18/19 "double, else stand"; others "else hit".
+            return "stand" if self._is_soft(hand) and hand.total() >= 18 else "hit"
+        return None
+
     def execute_action(self, username, action):
         """Primary action handler. Validates username owns the active seat."""
         if self.game_state != "playing":
@@ -530,9 +659,14 @@ class Table:
         current_hand = current_seat.hands[self.current_hand_idx]
         upcard = self.dealer_hand.cards[0]
 
-        # Track strategy mistakes
-        recommendation = basic_strategy(current_hand, upcard)
-        if action != recommendation:
+        # Reject anything that is not a legal move right now BEFORE grading it
+        # (REVIEW E8 / QA B2): a no-op must never show up as a "mistake".
+        if action not in self._legal_actions(current_seat, current_hand):
+            return
+
+        # Track strategy mistakes (graded against the best LEGAL play).
+        recommendation = self._recommended_action(current_seat, current_hand, upcard)
+        if recommendation is not None and action != recommendation:
             if not hasattr(current_hand, 'pending_mistakes'):
                 current_hand.pending_mistakes = []
             current_hand.pending_mistakes.append({
@@ -733,6 +867,9 @@ class Table:
         self.current_seat_turn_idx = 0
         self.current_hand_idx = 0
         self.game_state = "betting"
+        # Surface a pending shuffle now (shoePendingShuffle) so the UI can
+        # offer the cut before the next deal.
+        self._flag_reshuffle_if_short(sum(1 for s in self.seats if s.occupied))
         self.log("Round reset — place your bets.")
 
     # ----------------------------------------------------------------
@@ -747,9 +884,37 @@ class Table:
         rank = card_str[:-1]
         return Card(rank, suit)
 
+    # Key of the server-only block in a persisted snapshot. It holds the shoe
+    # order (and other engine internals) and must NEVER be sent to a client.
+    PRIVATE_KEY = "engine"
+
+    def to_snapshot(self):
+        """Full persisted state: the public to_json() view plus a private
+        `engine` block (shoe order, insurance decisions, ungraded mistakes).
+        from_snapshot(to_snapshot()) round-trips the table exactly
+        (REVIEW E4, QA B3/B4). Strip PRIVATE_KEY before sending to clients."""
+        snap = self.to_json()
+        pending = {}
+        for seat in self.seats:
+            per_hand = [list(getattr(h, 'pending_mistakes', [])) for h in seat.hands]
+            if any(per_hand):
+                pending[str(seat.number)] = per_hand
+        snap[self.PRIVATE_KEY] = {
+            "shoe": self.shoe.to_dict(),
+            "insuranceResponses": dict(self.insurance_responses),
+            "readyPlayers": list(self.ready_players),
+            "pendingMistakes": pending,
+        }
+        return snap
+
+    @classmethod
+    def public_view(cls, snapshot):
+        """A persisted snapshot with the server-only block removed."""
+        return {k: v for k, v in (snapshot or {}).items() if k != cls.PRIVATE_KEY}
+
     @classmethod
     def from_snapshot(cls, snapshot):
-        """Rebuild a Table from a persisted to_json() snapshot."""
+        """Rebuild a Table from a persisted to_snapshot() (or legacy to_json())."""
         table = cls()
         if not snapshot:
             return table
@@ -759,23 +924,35 @@ class Table:
         table.is_solo = bool(snapshot.get("isSolo", False))
         table.host_name = snapshot.get("hostName")
         table.room_name = snapshot.get("roomName")
-        if table.shoe.num_decks != table.settings["numDecks"]:
-            table.shoe = Shoe(table.settings["numDecks"])
+
+        private = snapshot.get(cls.PRIVATE_KEY) or {}
+        if private.get("shoe"):
+            table.shoe = Shoe.from_dict(private["shoe"])
+            table.running_count = snapshot.get("cardCounting", {}).get("runningCount", 0)
+        else:
+            # Legacy snapshot without a shoe: a fresh shoe means a fresh count.
+            if table.shoe.num_decks != table.settings["numDecks"]:
+                table.shoe = Shoe(table.settings["numDecks"])
+            table.running_count = 0
 
         table.game_state = snapshot.get("gameState", "betting")
         table.bot_names = list(snapshot.get("botNames", []))
         table.logs = list(snapshot.get("logs", []))
-        table.running_count = snapshot.get("cardCounting", {}).get("runningCount", 0)
+        table.round_mistakes = list(snapshot.get("roundMistakes", []))
         table.current_hand_idx = snapshot.get("activeHandIndex", 0)
         table.current_seat_turn_idx = snapshot.get("activeSeatTurnIdx", 0)
         table.active_seat_numbers = list(snapshot.get("activeSeatNumbers", []))
 
-        player_balances = {}
+        # One Player object per name, shared by all of that player's seats.
+        players = {}
         for p in snapshot.get("players", []):
-            player_balances[p["name"]] = p.get("balance", 5000)
-            if p.get("isReady"):
+            players[p["name"]] = Player(p["name"], p.get("balance", 5000))
+            if p.get("isReady") and p["name"] not in table.ready_players:
                 table.ready_players.append(p["name"])
+        if "readyPlayers" in private:
+            table.ready_players = list(private["readyPlayers"])
 
+        pending = private.get("pendingMistakes", {})
         for seat_data in snapshot.get("seats", []):
             # Skip seats beyond the current table size (e.g. old 7-seat snapshots).
             if not (1 <= seat_data["number"] <= len(table.seats)):
@@ -783,14 +960,17 @@ class Table:
             seat = table.seats[seat_data["number"] - 1]
             if seat_data.get("isOccupied"):
                 name = seat_data.get("playerName")
-                balance = seat_data.get("balance") or player_balances.get(name, 5000)
-                player = Player(name, balance)
-                seat.occupy(player)
+                if name not in players:
+                    bal = seat_data.get("balance")
+                    players[name] = Player(name, 5000 if bal is None else bal)
+                seat.occupy(players[name])
                 seat.bet = seat_data.get("bet", 0)
                 seat.perfect_pairs_amount = seat_data.get("ppBet", 0)
                 seat.twentyone_plus_3_amount = seat_data.get("t3Bet", 0)
+                seat.insurance_bet = seat_data.get("insuranceBet", 0)
                 seat.sidebet_results = seat_data.get("sidebetResults") or {"pp": None, "t3": None}
-                for h_data in seat_data.get("hands", []):
+                seat_pending = pending.get(str(seat.number), [])
+                for i, h_data in enumerate(seat_data.get("hands", [])):
                     hand = Hand(bet=h_data.get("bet", seat.bet))
                     hand.from_split = h_data.get("fromSplit", False)
                     hand.from_split_aces = h_data.get("fromSplitAces", False)
@@ -800,11 +980,16 @@ class Table:
                         card = cls._parse_card(c_str)
                         if card:
                             hand.add(card)
-                    if hand.is_ace_split():
-                        hand.from_split_aces = True
+                    # (fromSplitAces is always persisted; it used to be inferred
+                    # from an A,A hand, which wrongly froze an unsplit pair.)
+                    if i < len(seat_pending) and seat_pending[i]:
+                        hand.pending_mistakes = list(seat_pending[i])
                     seat.hands.append(hand)
-                if seat_data.get("insuranceDecisionMade"):
-                    table.insurance_responses[str(seat.number)] = True
+                if "insuranceResponses" not in private and seat_data.get("insuranceDecisionMade"):
+                    # Legacy: only "decided" was stored; infer the choice.
+                    table.insurance_responses[str(seat.number)] = seat.insurance_bet > 0
+        if "insuranceResponses" in private:
+            table.insurance_responses = dict(private["insuranceResponses"])
 
         dealer_data = snapshot.get("dealerHand", {})
         for c_str in dealer_data.get("cards", []):
@@ -851,6 +1036,7 @@ class Table:
                 "bet": seat.bet,
                 "ppBet": seat.perfect_pairs_amount,
                 "t3Bet": seat.twentyone_plus_3_amount,
+                "insuranceBet": seat.insurance_bet,
                 "ppDisplay": seat.sidebet_results["pp"] if seat.sidebet_results.get("pp") is not None else seat.perfect_pairs_amount,
                 "t3Display": seat.sidebet_results["t3"] if seat.sidebet_results.get("t3") is not None else seat.twentyone_plus_3_amount,
                 "sidebetResults": seat.sidebet_results,
@@ -879,7 +1065,9 @@ class Table:
                     current_hand = current_seat.hands[self.current_hand_idx]
                     if self.dealer_hand.cards:
                         upcard = self.dealer_hand.cards[0]
-                        suggestion = basic_strategy(current_hand, upcard)
+                        # Same legal-move advice the mistake tracker grades by.
+                        suggestion = (self._recommended_action(current_seat, current_hand, upcard)
+                                      or basic_strategy(current_hand, upcard))
                         bust_p = bust_probability(current_hand.total())
                         win_stand_p = player_win_probability(current_hand.total(), upcard.value())
                         optimal_p = optimal_win_probability(current_hand, upcard.value())

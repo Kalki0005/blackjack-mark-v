@@ -388,7 +388,7 @@ def get_user_rooms(username):
         if any(p.get("name") == username for p in players):
             result.append({
                 "id": room.id,
-                "state": state,
+                "state": Table.public_view(state),  # never leak the shoe order
                 "created_at": room.created_at.isoformat() if room.created_at else None,
                 "updated_at": room.updated_at.isoformat() if room.updated_at else None,
             })
@@ -518,7 +518,7 @@ def on_create_room(data):
         _seed_bots(new_table, data.get('bots', 0))
     ACTIVE_ROOMS[room_code] = new_table
 
-    new_room = GameRoom(id=room_code, state=new_table.to_json())
+    new_room = GameRoom(id=room_code, state=new_table.to_snapshot())
     db.session.add(new_room)
     db.session.commit()
 
@@ -645,8 +645,11 @@ def on_submit_action(data):
 @socketio.on('buy_insurance')
 def on_buy_insurance(data):
     room_code = data.get('room', '').upper()
-    seat_number = int(data.get('seat_number', 0))
     wants_insurance = data.get('wants_insurance', False)
+    try:
+        seat_number = int(data.get('seat_number', 0))
+    except (TypeError, ValueError):
+        return
 
     if room_code not in ACTIVE_ROOMS:
         return
@@ -705,7 +708,8 @@ def _persist_state(room_code, table):
     try:
         room_record = GameRoom.query.get(room_code)
         if room_record:
-            room_record.state = table.to_json()
+            # Full snapshot incl. the private shoe block (REVIEW E4 / QA B4).
+            room_record.state = table.to_snapshot()
             db.session.commit()
     except Exception as e:
         print(f"State persist error: {e}")
