@@ -18,9 +18,9 @@ HOW TO RUN (from the repo root, with the project venv):
 
     "C:\\Users\\Sai Shetty\\OneDrive\\Desktop\\Blackjack\\Mark V\\venv\\Scripts\\python.exe" backend\\sim.py
 
-Optional: `backend\\sim.py 3000000` overrides the round count (default 1,000,000,
+Optional: `backend\\sim.py 3000000` overrides the round count (default 4,000,000,
 ~35s). The std-error of the measured edge is ~1.15/sqrt(N): ~0.115% at 1M rounds,
-so keep N >= 1M or the 0.3%-0.8% band can be tripped by noise alone. Runs are
+so keep N >= 4M or the 0.3%-0.8% band can be tripped by noise alone. Runs are
 seeded, so a given N is fully reproducible.
 
 The player uses backend/strategy.py's basic_strategy() for every decision and
@@ -78,7 +78,7 @@ def _play_out(table, player):
         table.execute_action(player.name, _decide(table, player, seat))
 
 
-def run_sim(rounds=1000000, bet=100, seed=42, settings=None, verbose=False):
+def run_sim(rounds=4000000, bet=100, seed=42, settings=None, verbose=False):
     """Play `rounds` basic-strategy rounds. Returns a stats dict.
 
     Note: bet should be >= 100 so blackjack's int(bet * 2.5) is exact (a bet of
@@ -136,7 +136,7 @@ def run_sim(rounds=1000000, bet=100, seed=42, settings=None, verbose=False):
 
 
 def main():
-    rounds = 1000000
+    rounds = 4000000
     if len(sys.argv) > 1:
         rounds = int(sys.argv[1])
 
