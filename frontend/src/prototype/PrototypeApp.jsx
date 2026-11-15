@@ -86,11 +86,13 @@ function Stage({ api, orbit, onUi }) {
   }, [camera, size])
 
   const lookTarget = useRef(CAMERA_TARGET.clone())
-  const acc = useRef({ frames: 0, time: 0, worst: 0, t: 0 })
+  const acc = useRef({ frames: 0, time: 0, worst: 0, t: 0, js: 0 })
   useFrame((_, rawDt) => {
     const dt = Math.min(rawDt, 0.05)
+    const t0 = performance.now()
     director.update(dt)
     rig.update(dt)
+    acc.current.js += performance.now() - t0
 
     if (!orbit) {
       const a = acc.current
@@ -116,9 +118,10 @@ function Stage({ api, orbit, onUi }) {
     if (a.time >= 0.5) {
       stats.fps = Math.round(a.frames / a.time)
       stats.low = Math.round(1 / a.worst)
+      stats.jsMs = +(a.js / a.frames).toFixed(2)
       stats.calls = gl.info.render.calls
       stats.tris = gl.info.render.triangles
-      a.frames = 0; a.time = 0; a.worst = 0
+      a.frames = 0; a.time = 0; a.worst = 0; a.js = 0
     }
   })
 
@@ -178,7 +181,7 @@ function StatsPanel() {
     const id = setInterval(() => {
       if (!ref.current) return
       ref.current.textContent =
-        `${stats.fps} fps (worst frame ${stats.low}) · ${stats.calls} draw calls · ${(stats.tris / 1000).toFixed(1)}k tris · first frame ${stats.ttff ?? '…'} ms`
+        `${stats.fps} fps (worst frame ${stats.low}) · anim ${stats.jsMs ?? 0} ms · ${stats.calls} draw calls · ${(stats.tris / 1000).toFixed(1)}k tris · first frame ${stats.ttff ?? '…'} ms`
     }, 500)
     return () => clearInterval(id)
   }, [])

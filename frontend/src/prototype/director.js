@@ -291,7 +291,18 @@ export class Director {
         this.sfx.knock()
       }
       this.restHand(side)
-      await this.tl.wait(0.5)
+      this.lookUp()
+      await this.tl.wait(0.45)
+      // the player takes the bet back
+      const from = bet.position.clone(), rail = railSpot(ev.seat)
+      this.sfx.chips(2)
+      this.tl.tween(0.5, (k) => { bet.position.lerpVectors(from, rail, k); bet.scale.setScalar(1 - k * 0.6) }, ease.in)
+        .then(() => this.group.remove(bet))
+      seat.bet = null
+      seat.amount = 0
+      seat.status = ''
+      this._ui()
+      await this.tl.wait(0.3)
       return
     }
 
