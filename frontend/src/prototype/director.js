@@ -50,6 +50,7 @@ export class Director {
     this.dealer = { cards: [], revealed: true }
     this.caption = ''
     this.discardCount = 0
+    this.clearing = false
   }
 
   reset() {
@@ -98,11 +99,11 @@ export class Director {
     this.onUi?.({
       caption: this.caption,
       seats: this.seats.map((s) => ({
-        total: s.cards.length ? handTotal(s.cards.map((c) => c.userData.code)) : null,
+        total: s.cards.length && !this.clearing ? handTotal(s.cards.map((c) => c.userData.code)) : null,
         status: s.status,
         amount: s.amount,
       })),
-      dealer: { total: this.dealer.cards.length ? handTotal(this.dealer.cards.map((c) => c.userData.code)) : null },
+      dealer: { total: this.dealer.cards.length && !this.clearing ? handTotal(this.dealer.cards.map((c) => c.userData.code)) : null },
     })
   }
   say(key) {
@@ -394,6 +395,9 @@ export class Director {
 
   async roundEnd() {
     await this.tl.wait(0.4)
+    this.clearing = true
+    for (const s of this.seats) s.status = ''
+    this._ui()
     const piles = this.seats.map((s) => s.cards)
     piles.push(this.dealer.cards)
     await this.sweepCards(piles)
@@ -403,6 +407,7 @@ export class Director {
       if (s.bet) { this.group.remove(s.bet); s.bet = null; s.amount = 0 }
     }
     this.dealer.cards = []
+    this.clearing = false
     this._ui()
     this.lookUp()
   }
